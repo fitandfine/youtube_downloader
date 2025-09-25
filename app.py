@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-yt_downloader_gui.py
+app.py
 
 A user-friendly YouTube downloader GUI using pytube and tkinter.
 
@@ -39,8 +39,8 @@ from tkinter import (
 # ttk is the themed widgets submodule
 from tkinter import ttk
 
-# pytube for YouTube downloads
-from pytube import YouTube  # ensure pytube is installed: pip install pytube
+# pytubefix for YouTube downloads
+from pytubefix import YouTube  # ensure pytubefix is installed: pip install pytubefix
 
 # ---------------------------
 # Worker queue for thread-safe UI updates
@@ -51,7 +51,7 @@ ui_queue = queue.Queue()
 
 
 # ---------------------------
-# Progress callback for pytube
+# Progress callback for pytubefix
 # ---------------------------
 def on_progress(stream, chunk, bytes_remaining):
     """
@@ -312,7 +312,7 @@ class YTDownloaderApp:
 def main():
     # Friendly check for pytube (although we've already imported it at top)
     try:
-        import pytube  # noqa: F401
+        import pytubefix  # noqa: F401
     except Exception:
         print("pytube is not installed. Please install with: pip install -r requirements.txt")
         sys.exit(1)
