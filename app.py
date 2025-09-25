@@ -161,7 +161,7 @@ def download_worker(url, resolution, video_format, audio_format, folder, downloa
 class YTDownloaderApp:
     def __init__(self, root):
         self.root = root
-        root.title("YouTube Downloader - Separate Progress Bars")
+        root.title("YouTube Downloader - by Anup Chapain")
         root.geometry("950x450")
         root.resizable(True, True)
 
