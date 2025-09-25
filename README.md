@@ -212,7 +212,7 @@ pip install pytubefix
 3. **Install FFmpeg**:
 
 * Ubuntu: `sudo apt install ffmpeg`
-* Windows: Download [FFmpeg](https://ffmpeg.org/download.html) and add to PATH
+* Windows: Download [FFmpeg](https://ffmpeg.org/download.html) and add to PATH see here: https://www.wikihow.com/Install-FFmpeg-on-Windows
 * macOS: `brew install ffmpeg`
 
 ---
