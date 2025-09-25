@@ -2,26 +2,36 @@
 """
 app.py
 
-A user-friendly YouTube downloader GUI using pytube and tkinter.
+YouTube Downloader (GUI) — single-author, full-featured implementation.
 
-Features:
- - Enter a YouTube URL
- - Fetch available resolutions (progressive mp4 streams)
- - Choose download folder
- - Start download with live progress bar and status
- - Comprehensive inline comments for learning and modification
+This program:
+ - Accepts a YouTube URL
+ - Fetches all available video resolutions (adaptive + progressive)
+ - Lets the user choose a resolution up to 4K (if available)
+ - Downloads the chosen video-only stream and the best audio stream
+ - Shows combined progress for the whole operation (video + audio)
+ - Uses ffmpeg to merge video + audio into a single MP4 (fast copy where possible)
+ - Cleans up temporary files and reports final output path
 
-Target platform: Linux (Ubuntu).
+Notes:
+ - This code uses `pytubefix` (a reliable pytube fork). You can switch to the
+   official pytube if you prefer (pip install -U git+https://github.com/pytube/pytube).
+ - Requires `ffmpeg` installed on the system (apt install ffmpeg on Ubuntu).
+ - GUI built with tkinter (install python3-tk on Debian/Ubuntu).
+ - Designed to be readable and consistent as if written by one developer over time.
 """
 
-import threading
-import queue
+from __future__ import annotations
+
 import os
 import sys
+import threading
 import traceback
+import queue
+import subprocess
+from typing import Optional, Dict
 
-# Import tkinter GUI building blocks.
-# Note: DoubleVar, StringVar etc. are in the base tkinter module.
+# tkinter standard widgets + ttk for themed widgets
 from tkinter import (
     Tk,
     StringVar,
@@ -30,109 +40,242 @@ from tkinter import (
     Entry,
     Label,
     filedialog,
-    N,
-    S,
+    END,
     E,
     W,
-    END,
 )
-# ttk is the themed widgets submodule
 from tkinter import ttk
 
-# pytubefix for YouTube downloads
-from pytubefix import YouTube  # ensure pytubefix is installed: pip install pytubefix
+# Use pytubefix as our YouTube backend for more resilience to site changes.
+# If you prefer the official pytube, import from pytube instead.
+from pytubefix import YouTube  # pip install pytubefix
 
-# ---------------------------
-# Worker queue for thread-safe UI updates
-# ---------------------------
-# We'll use a queue to send progress updates from background threads back
-# to the main tkinter thread so that UI updates are only performed in the main thread.
+# -----------------------------------------------------------------------------
+# Global queue used for safely passing data from worker threads back to the UI
+# -----------------------------------------------------------------------------
 ui_queue = queue.Queue()
 
+# -----------------------------------------------------------------------------
+# Download tracking state
+#
+# We download two streams (video-only + audio-only). pytube/pytubefix calls our
+# on_progress callback with (stream, chunk, bytes_remaining). To compute a
+# combined percent, we keep a small tracker keyed by stream.itag:
+#
+#   DOWNLOAD_TRACKER = {
+#       <itag>: {"total": <bytes_total>, "downloaded": <bytes_downloaded>}
+#   }
+#
+# Combined percent = sum(downloaded) / sum(total) * 100
+# -----------------------------------------------------------------------------
+DOWNLOAD_TRACKER: Dict[int, Dict[str, float]] = {}
 
-# ---------------------------
-# Progress callback for pytubefix
-# ---------------------------
+# -----------------------------------------------------------------------------
+# Helper: sanitize filename to avoid problematic characters
+# -----------------------------------------------------------------------------
+def sanitize_filename(name: str) -> str:
+    # Keep alnum, space, dot, dash, underscore; replace others with underscore
+    return "".join(c if (c.isalnum() or c in " ._-") else "_" for c in name).strip()
+
+# -----------------------------------------------------------------------------
+# Progress callback used by pytubefix
+# -----------------------------------------------------------------------------
 def on_progress(stream, chunk, bytes_remaining):
     """
-    pytube calls this during download. We compute percent and push to UI queue.
-    - stream: the Stream object being downloaded
-    - chunk: the latest bytes chunk (unused here)
-    - bytes_remaining: how many bytes are left to download
+    Called by pytube/pytubefix while a stream is downloading.
+
+    We update DOWNLOAD_TRACKER[itag]['downloaded'] and push an aggregated
+    progress update into ui_queue so the GUI can update the progress bar.
     """
     try:
-        total_size = stream.filesize  # total size in bytes
-        bytes_downloaded = total_size - bytes_remaining
-        percent = (bytes_downloaded / total_size) * 100 if total_size else 0.0
-        # Put progress update into queue for the main thread
+        itag = int(stream.itag)
+        total = getattr(stream, "filesize", None) or getattr(stream, "filesize_approx", None) or 0
+        # bytes downloaded so far for this stream
+        downloaded = (total - bytes_remaining) if total else 0
+
+        # Update tracker (create if necessary)
+        if itag not in DOWNLOAD_TRACKER:
+            DOWNLOAD_TRACKER[itag] = {"total": float(total), "downloaded": float(downloaded)}
+        else:
+            DOWNLOAD_TRACKER[itag]["total"] = float(total)
+            DOWNLOAD_TRACKER[itag]["downloaded"] = float(downloaded)
+
+        # Compute combined percent across all tracked streams
+        sum_total = sum(v["total"] for v in DOWNLOAD_TRACKER.values())
+        sum_downloaded = sum(v["downloaded"] for v in DOWNLOAD_TRACKER.values())
+        percent = (sum_downloaded / sum_total * 100.0) if sum_total else 0.0
+
         ui_queue.put(("progress", percent))
     except Exception:
-        # If anything goes wrong, send a status update for visibility
-        ui_queue.put(("status", "Error computing progress"))
+        # Don't crash the downloader because of UI update bugs; report status.
+        tb = traceback.format_exc()
+        ui_queue.put(("status", f"Progress callback error: {tb.splitlines()[-1]}"))
 
-
-# ---------------------------
-# Core download logic (runs in background thread)
-# ---------------------------
-def download_video(url, resolution, dest_folder):
+# -----------------------------------------------------------------------------
+# Worker: download chosen streams and merge with ffmpeg
+# -----------------------------------------------------------------------------
+def download_and_merge(url: str, resolution: Optional[str], dest_folder: str):
     """
-    Download the YouTube video at `url` with the chosen `resolution` to `dest_folder`.
-    Sends status/progress updates into ui_queue.
+    End-to-end worker that:
+      1. Creates a YouTube object (with progress callback)
+      2. Selects the requested video-only stream and the best audio-only stream
+      3. Downloads both streams while reporting combined progress
+      4. Uses ffmpeg to merge into final file
+      5. Cleans up temp files and notifies UI of completion
     """
     try:
         ui_queue.put(("status", "Connecting to YouTube..."))
-
-        # Create YouTube object and register the progress callback
         yt = YouTube(url, on_progress_callback=on_progress)
+        ui_queue.put(("status", f"Found video: {yt.title}"))
 
-        ui_queue.put(("status", f"Video found: {yt.title}"))
+        # Build lists of candidate streams (video-only prioritized)
+        # include mp4 container video-only streams (adaptive). We order by resolution desc.
+        video_candidates = yt.streams.filter(file_extension="mp4", only_video=True).order_by("resolution").desc()
+        if not video_candidates:
+            # fallback to progressive mp4 streams (contain audio). This should rarely happen,
+            # but we keep fallback logic for robustness.
+            video_candidates = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc()
 
-        # Filter streams to progressive mp4 streams (contain both video+audio)
-        streams = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc()
-
-        if not streams:
-            ui_queue.put(("error", "No progressive mp4 streams available for this video."))
+        if not video_candidates:
+            ui_queue.put(("error", "No downloadable video streams found for this video."))
             return
 
-        # If resolution provided, try to match it
-        chosen_stream = None
+        # Determine which resolution to pick
+        selected_video_stream = None
         if resolution:
-            for s in streams:
+            for s in video_candidates:
                 if s.resolution == resolution:
-                    chosen_stream = s
+                    selected_video_stream = s
                     break
 
-        # Fallback to best available progressive stream
-        if not chosen_stream:
-            chosen_stream = streams.first()
-            ui_queue.put(("status", f"Selected best available resolution: {chosen_stream.resolution}"))
+        # If the exact resolution wasn't found, pick the highest available (first in desc list)
+        if not selected_video_stream:
+            selected_video_stream = video_candidates.first()
+            ui_queue.put(("status", f"Selected best available video: {selected_video_stream.resolution}"))
 
-        # Ensure destination folder exists
+        # Pick the best audio-only stream (highest abr)
+        audio_stream = yt.streams.filter(only_audio=True, file_extension="mp4").order_by("abr").desc().first()
+        if not audio_stream:
+            # Some videos may not have mp4 audio; fallback to any audio stream
+            audio_stream = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
+
+        if not audio_stream:
+            ui_queue.put(("error", "No downloadable audio stream found for this video."))
+            return
+
+        # Prepare destination and filenames
         os.makedirs(dest_folder, exist_ok=True)
+        safe_base = sanitize_filename(yt.title)
+        video_temp_name = os.path.join(dest_folder, f"{safe_base}.video.temp.mp4")
+        audio_temp_name = os.path.join(dest_folder, f"{safe_base}.audio.temp.m4a")
+        final_name = os.path.join(dest_folder, f"{safe_base}.mp4")
 
-        ui_queue.put(("status", f"Starting download to: {dest_folder}"))
-        # Start the blocking download (safe inside background thread)
-        out_file = chosen_stream.download(output_path=dest_folder)
+        # Clear any previous tracker entries
+        DOWNLOAD_TRACKER.clear()
+
+        # We will instruct pytube to write to the exact temp filenames. pytube's download()
+        # optionally accepts a 'filename' (without path) and output_path; to avoid name
+        # collisions we pass full path via output_path and filename.
+        ui_queue.put(("status", f"Downloading video track ({selected_video_stream.resolution})..."))
+        # Note: pytube's download uses stream.default_filename if no filename given; to force a name
+        # that we control we pass filename=... (but pytube will append extension if necessary).
+        # Some stream.download implementations append extension automatically; to be safe,
+        # use the stream.download(output_path=dest_folder, filename=...) pattern and then rename
+        # if needed. We'll use a small helper: download returns the actual path it wrote.
+        video_written = selected_video_stream.download(output_path=dest_folder, filename=f"{safe_base}.video.temp")
+        # download returns path; ensure it matches expected extension
+        if not video_written.endswith(".mp4"):
+            # rename to .mp4 for ffmpeg compatibility
+            new_video_written = os.path.splitext(video_written)[0] + ".mp4"
+            try:
+                os.replace(video_written, new_video_written)
+                video_written = new_video_written
+            except Exception:
+                pass
+
+        # Update our temp name to the actual written file
+        video_temp_name = video_written
+
+        ui_queue.put(("status", "Downloading audio track (best available)..."))
+        audio_written = audio_stream.download(output_path=dest_folder, filename=f"{safe_base}.audio.temp")
+        # audio may be .mp4 or .m4a depending on stream; normalize to .m4a for ffmpeg
+        if not (audio_written.endswith(".m4a") or audio_written.endswith(".mp4") or audio_written.endswith(".aac")):
+            new_audio_written = os.path.splitext(audio_written)[0] + ".m4a"
+            try:
+                os.replace(audio_written, new_audio_written)
+                audio_written = new_audio_written
+            except Exception:
+                pass
+
+        audio_temp_name = audio_written
+
+        # At this point the on_progress callbacks would have been firing and updating the UI.
+        # Now perform the merge with ffmpeg. We use stream copy for video and encode audio to aac
+        # if necessary. Use -y to overwrite any existing file with same name.
+        ui_queue.put(("status", "Merging video & audio with ffmpeg..."))
+
+        # Build ffmpeg command:
+        # - try to copy the video stream (-c:v copy) and set audio to aac (-c:a aac)
+        # - ensure fast operations by not re-encoding video
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",  # show only errors — we capture return code
+            "-i",
+            video_temp_name,
+            "-i",
+            audio_temp_name,
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-strict",
+            "-2",
+            final_name,
+        ]
+
+        # Run ffmpeg and check for issues
+        proc = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            # Merge failed — inform user and keep temp files for debugging
+            ui_queue.put(("error", f"ffmpeg merge failed: {proc.stderr.decode('utf-8', errors='replace')[:300]}"))
+            return
+
+        # If merge succeeded, remove temp files
+        try:
+            if os.path.exists(video_temp_name):
+                os.remove(video_temp_name)
+            if os.path.exists(audio_temp_name):
+                os.remove(audio_temp_name)
+        except Exception:
+            # Non-fatal — but inform in logs
+            ui_queue.put(("status", "Merged but failed to remove temp files."))
 
         ui_queue.put(("progress", 100.0))
-        ui_queue.put(("status", f"Download complete: {os.path.basename(out_file)}"))
-        ui_queue.put(("done", out_file))
+        ui_queue.put(("status", f"Download complete: {os.path.basename(final_name)}"))
+        ui_queue.put(("done", final_name))
+
     except Exception as e:
         tb = traceback.format_exc()
         ui_queue.put(("error", f"Download error: {str(e)}\n{tb}"))
 
-
-# ---------------------------
-# GUI application class
-# ---------------------------
+# -----------------------------------------------------------------------------
+# GUI application class (single-author style, consistent comments)
+# -----------------------------------------------------------------------------
 class YTDownloaderApp:
-    def __init__(self, root):
+    """
+    The main GUI class encapsulates UI construction, event handlers, and the
+    periodic UI queue processing loop.
+    """
+
+    def __init__(self, root: Tk):
         self.root = root
-        root.title("YouTube Downloader - pytube + tkinter")
-        root.geometry("640x320")
+        root.title("YouTube Downloader — Full-Featured (video+audio, ffmpeg)")
+        root.geometry("720x360")
         root.resizable(False, False)
 
-        # --- Tk variables for two-way binding to widgets ---
+        # Bindable variables used by widgets
         self.url_var = StringVar()
         self.resolution_var = StringVar()
         self.folder_var = StringVar()
@@ -140,192 +283,202 @@ class YTDownloaderApp:
         self.progress_var = DoubleVar(value=0.0)
         self.percent_var = StringVar(value="0.0%")
 
-        # This will store available resolution options AFTER fetching
-        # IMPORTANT: define this BEFORE building widgets that reference it
+        # Holds the resolutions available after a fetch; defined before widgets so the combobox can reference it
         self.available_resolutions = []
 
-        # Build UI layout
+        # Build the widgets
         self._build_widgets()
 
-        # Start the periodic UI queue processor (to consume ui_queue)
-        self.root.after(100, self.process_ui_queue)
+        # Start timer that consumes ui_queue (updates UI from worker threads)
+        self.root.after(100, self._process_ui_queue)
 
     def _build_widgets(self):
-        """Construct all UI widgets and layout using grid geometry."""
-        # URL label + entry + fetch button
-        Label(self.root, text="YouTube URL:").grid(row=0, column=0, padx=8, pady=(12, 6), sticky=E)
-        Entry(self.root, textvariable=self.url_var, width=56).grid(row=0, column=1, columnspan=2, padx=8, pady=(12, 6), sticky=W)
-        Button(self.root, text="Fetch Resolutions", command=self.fetch_resolutions).grid(row=0, column=3, padx=8, pady=(12, 6))
+        """
+        Create labels, entries, comboboxes, progressbar and buttons.
+        Layout uses grid with small padding to look tidy.
+        """
+        # URL input row
+        Label(self.root, text="YouTube URL:").grid(row=0, column=0, padx=10, pady=(12, 6), sticky=E)
+        Entry(self.root, textvariable=self.url_var, width=68).grid(row=0, column=1, columnspan=2, padx=6, pady=(12, 6), sticky=W)
+        Button(self.root, text="Fetch Resolutions", command=self.fetch_resolutions).grid(row=0, column=3, padx=10, pady=(12, 6))
 
-        # Resolution selection
-        Label(self.root, text="Resolution:").grid(row=1, column=0, padx=8, pady=6, sticky=E)
+        # Resolution selection row
+        Label(self.root, text="Resolution:").grid(row=1, column=0, padx=10, pady=6, sticky=E)
         self.res_combo = ttk.Combobox(self.root, textvariable=self.resolution_var, values=self.available_resolutions, state="readonly", width=20)
-        self.res_combo.grid(row=1, column=1, padx=8, pady=6, sticky=W)
-        Label(self.root, text="(progressive mp4 streams only)").grid(row=1, column=2, padx=8, pady=6, sticky=W)
+        self.res_combo.grid(row=1, column=1, padx=6, pady=6, sticky=W)
+        Label(self.root, text="(adaptive video-only streams shown; ffmpeg merges audio)").grid(row=1, column=2, columnspan=2, padx=6, pady=6, sticky=W)
 
-        # Destination folder selection
-        Label(self.root, text="Download folder:").grid(row=2, column=0, padx=8, pady=6, sticky=E)
-        Entry(self.root, textvariable=self.folder_var, width=44).grid(row=2, column=1, columnspan=2, padx=8, pady=6, sticky=W)
-        Button(self.root, text="Choose...", command=self.choose_folder).grid(row=2, column=3, padx=8, pady=6)
+        # Destination folder row
+        Label(self.root, text="Download folder:").grid(row=2, column=0, padx=10, pady=6, sticky=E)
+        Entry(self.root, textvariable=self.folder_var, width=52).grid(row=2, column=1, columnspan=2, padx=6, pady=6, sticky=W)
+        Button(self.root, text="Choose...", command=self.choose_folder).grid(row=2, column=3, padx=10, pady=6)
 
-        # Progress bar and percent label
-        self.progress_bar = ttk.Progressbar(self.root, orient="horizontal", length=480, mode="determinate", variable=self.progress_var, maximum=100)
+        # Progress bar
+        self.progress_bar = ttk.Progressbar(self.root, orient="horizontal", length=620, mode="determinate", variable=self.progress_var, maximum=100)
         self.progress_bar.grid(row=3, column=0, columnspan=4, padx=12, pady=(12, 6))
-        self.percent_label = Label(self.root, textvariable=self.percent_var)
-        self.percent_label.grid(row=4, column=3, padx=8, pady=(0, 6), sticky=E)
+        Label(self.root, textvariable=self.percent_var).grid(row=4, column=3, padx=10, pady=(0, 6), sticky=E)
 
-        # Status text label
-        Label(self.root, text="Status:").grid(row=4, column=0, padx=8, pady=(0, 6), sticky=E)
-        Label(self.root, textvariable=self.status_var, anchor="w", justify="left").grid(row=4, column=1, columnspan=2, padx=8, pady=(0, 6), sticky=W)
+        # Status line
+        Label(self.root, text="Status:").grid(row=4, column=0, padx=10, pady=(0, 6), sticky=E)
+        Label(self.root, textvariable=self.status_var, anchor="w", justify="left", width=60).grid(row=4, column=1, columnspan=2, padx=6, pady=(0, 6), sticky=W)
 
         # Download button
-        Button(self.root, text="Download", command=self.start_download_thread, width=12).grid(row=5, column=3, padx=8, pady=(6, 12), sticky=E)
+        Button(self.root, text="Download & Merge", command=self.start_download, width=18).grid(row=5, column=3, padx=12, pady=(6, 12), sticky=E)
 
-        # Configure grid weights for a bit of responsive spacing
-        self.root.grid_columnconfigure(1, weight=1)
+        # set sensible default downloads folder
+        downloads_folder = os.path.join(os.path.expanduser("~"), "Downloads")
+        self.folder_var.set(downloads_folder if os.path.isdir(downloads_folder) else os.path.expanduser("~"))
 
     # ---------------------------
-    # UI actions
+    # UI action helpers
     # ---------------------------
     def choose_folder(self):
-        """Open a folder chooser and set the folder_var if the user picked one."""
+        """Open the directory chooser and set the folder_var if user selects one."""
         folder = filedialog.askdirectory()
         if folder:
             self.folder_var.set(folder)
 
     def fetch_resolutions(self):
         """
-        Fetch available progressive mp4 resolutions for the provided URL.
-        Runs fetch in a background thread to avoid freezing the GUI.
+        Trigger a background worker that fetches available video resolutions
+        (adaptive video-only streams are prioritized).
         """
         url = self.url_var.get().strip()
         if not url:
-            self.status_var.set("Please enter a YouTube URL first.")
+            self.status_var.set("Please paste a YouTube URL first.")
             return
 
-        # Launch background thread for fetching stream list
-        threading.Thread(target=self._fetch_resolutions_background, args=(url,), daemon=True).start()
+        # Run the fetch in a background thread to avoid blocking the UI
+        threading.Thread(target=self._fetch_resolutions_worker, args=(url,), daemon=True).start()
         self.status_var.set("Fetching available resolutions...")
 
-    def _fetch_resolutions_background(self, url):
-        """Background worker: query YouTube for progressive mp4 streams and send results to ui_queue."""
+    def _fetch_resolutions_worker(self, url: str):
+        """
+        Background worker that queries YouTube for streams and sends a
+        'resolutions' message into ui_queue for the main thread to consume.
+        """
         try:
-            yt = YouTube(url)  # no progress callback needed for this query
-            streams = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc()
+            yt = YouTube(url)
+            # prefer adaptive video-only mp4 streams, order highest resolution first
+            video_streams = yt.streams.filter(file_extension="mp4", only_video=True).order_by("resolution").desc()
+
+            # Fallback to progressive mp4 streams if no adaptive found
+            if not video_streams:
+                video_streams = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc()
+
             res_list = []
-            for s in streams:
+            for s in video_streams:
+                # s.resolution is like '1080p' or None (skip None)
                 if s.resolution and s.resolution not in res_list:
                     res_list.append(s.resolution)
 
             if not res_list:
-                ui_queue.put(("error", "No progressive mp4 streams found for this video."))
+                ui_queue.put(("error", "No video streams (resolutions) found for this video."))
                 return
 
-            # Put resolutions and video title into the UI queue for the main thread to consume
             ui_queue.put(("resolutions", res_list, yt.title))
         except Exception as e:
             tb = traceback.format_exc()
-            ui_queue.put(("error", f"Error fetching resolutions: {e}\n{tb}"))
+            ui_queue.put(("error", f"Failed to fetch resolutions: {e}\n{tb}"))
 
-    def start_download_thread(self):
-        """Validate inputs and start the download in a background thread."""
+    def start_download(self):
+        """
+        Validate inputs and start the download+merge operation in a background thread.
+        This keeps the GUI responsive while the heavy lifting is done off the main thread.
+        """
         url = self.url_var.get().strip()
         resolution = self.resolution_var.get()
-        dest_folder = self.folder_var.get().strip() or os.path.expanduser("~")  # default to home
+        dest = self.folder_var.get().strip() or os.path.expanduser("~")
 
         if not url:
-            self.status_var.set("Enter a YouTube URL before downloading.")
+            self.status_var.set("Enter a YouTube URL before trying to download.")
             return
 
-        # Ensure destination folder exists or can be created
-        if not os.path.isdir(dest_folder):
+        if not os.path.isdir(dest):
             try:
-                os.makedirs(dest_folder, exist_ok=True)
+                os.makedirs(dest, exist_ok=True)
             except Exception:
-                self.status_var.set("Invalid download folder. Choose a valid folder.")
+                self.status_var.set("Invalid download folder — choose a valid directory.")
                 return
 
-        # Reset progress UI
+        # Reset tracker & UI progress
+        DOWNLOAD_TRACKER.clear()
         self.progress_var.set(0.0)
         self.percent_var.set("0.0%")
         self.status_var.set("Queued for download...")
 
-        # Start download in background
-        thread = threading.Thread(target=download_video, args=(url, resolution, dest_folder), daemon=True)
-        thread.start()
+        # Start the background worker
+        threading.Thread(target=download_and_merge, args=(url, resolution, dest), daemon=True).start()
 
     # ---------------------------
-    # UI queue processor (runs periodically in main thread)
+    # UI queue consumer (runs on main thread)
     # ---------------------------
-    def process_ui_queue(self):
+    def _process_ui_queue(self):
         """
-        Called periodically via tkinter's `after` to process queued UI updates
-        from other threads (download + fetch workers).
+        Periodically run on the tkinter mainloop to process messages from ui_queue.
+        Messages:
+          - ("progress", percent_float)
+          - ("status", string)
+          - ("resolutions", [list_of_res], video_title)
+          - ("error", string)
+          - ("done", final_path)
         """
         try:
             while not ui_queue.empty():
-                item = ui_queue.get_nowait()
-                if not item:
+                msg = ui_queue.get_nowait()
+                if not msg:
                     continue
-                tag = item[0]
+                tag = msg[0]
 
                 if tag == "progress":
-                    percent = float(item[1])
-                    # Update progress bar and percent label
+                    percent = float(msg[1])
                     self.progress_var.set(percent)
                     self.percent_var.set(f"{percent:.1f}%")
                 elif tag == "status":
-                    msg = item[1]
-                    self.status_var.set(msg)
+                    self.status_var.set(str(msg[1]))
                 elif tag == "resolutions":
-                    res_list = item[1]
-                    title = item[2] if len(item) > 2 else ""
+                    res_list, title = msg[1], msg[2] if len(msg) > 2 else ""
                     self.available_resolutions = res_list
-                    # Safely update combobox values on main thread
                     self.res_combo["values"] = self.available_resolutions
                     if self.available_resolutions:
-                        self.res_combo.current(0)  # select first (highest) by default
+                        self.res_combo.current(0)
                         self.resolution_var.set(self.available_resolutions[0])
                     self.status_var.set(f"Found {len(res_list)} resolution(s) for '{title}'")
                 elif tag == "error":
-                    msg = item[1]
-                    # Update status and print detailed error to stderr for debugging
-                    self.status_var.set("Error: " + (msg.splitlines()[0] if msg else "Unknown error"))
-                    print("ERROR:", msg, file=sys.stderr)
+                    # show short error in status (longer detail is logged to stderr)
+                    err = str(msg[1])
+                    short = err.splitlines()[0] if err else "Unknown error"
+                    self.status_var.set("Error: " + short)
+                    print("ERROR:", err, file=sys.stderr)
                 elif tag == "done":
-                    out_path = item[1]
-                    self.status_var.set(f"Done: {os.path.basename(out_path)}")
+                    final = msg[1]
+                    self.status_var.set(f"Done: {final}")
+                    # set progress to full if not already
+                    self.progress_var.set(100.0)
+                    self.percent_var.set("100.0%")
                 else:
-                    # Unknown message tag: display it as status for visibility
-                    self.status_var.set(str(item))
+                    # Unknown message -> display for debugging
+                    self.status_var.set(str(msg))
         except Exception as e:
-            # Avoid crashing the periodic callback silently
-            print("Exception in process_ui_queue:", e, file=sys.stderr)
+            # Avoid the callback dying silently; log to stderr
+            print("Exception in UI queue processing:", e, file=sys.stderr)
 
-        # Schedule the next check 100 ms later
-        self.root.after(100, self.process_ui_queue)
+        # Re-schedule this method to run again after 100 ms
+        self.root.after(100, self._process_ui_queue)
 
-
-# ---------------------------
-# Main entrypoint
-# ---------------------------
+# -----------------------------------------------------------------------------
+# Entrypoint
+# -----------------------------------------------------------------------------
 def main():
-    # Friendly check for pytube (although we've already imported it at top)
+    # Quick sanity check for ffmpeg availability (we rely on it for merging)
     try:
-        import pytubefix  # noqa: F401
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
-        print("pytube is not installed. Please install with: pip install -r requirements.txt")
-        sys.exit(1)
+        print("Warning: ffmpeg not found or not runnable. Please install ffmpeg for merging.", file=sys.stderr)
 
     root = Tk()
     app = YTDownloaderApp(root)
-
-    # Prefill download folder to ~/Downloads if available
-    downloads_folder = os.path.join(os.path.expanduser("~"), "Downloads")
-    app.folder_var.set(downloads_folder if os.path.isdir(downloads_folder) else os.path.expanduser("~"))
-
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
