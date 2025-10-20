@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# ========================================================
+# Script Name: ytube
+# Author: Anup Chapain
+# Date: 2025-10-21
+# Description:
+#   This script navigates to the youtube_downloader project directory,
+#   activates the 'yt' Python virtual environment, and runs app.py.
+#   Shortcut: You can run this script system-wide by typing `ytube` from any directory.
+# ========================================================
+
+# --------- Configuration ---------
+# Absolute path to the project directory
+PROJECT_DIR="/home/anup/Portfolio/youtube_downloader"
+# Name of the Python virtual environment folder inside the project directory
+VENV_NAME="yt"
+# Python script to run
+PYTHON_FILE="app.py"
+
+# --------- Navigate to Project Directory ---------
+if [ -d "$PROJECT_DIR" ]; then
+    cd "$PROJECT_DIR" || { 
+        echo "Error: Failed to navigate to $PROJECT_DIR"; 
+        exit 1; 
+    }
+else
+    echo "Error: Project directory $PROJECT_DIR does not exist"
+    exit 1
+fi
+
+# --------- Activate Virtual Environment ---------
+if [ -f "$VENV_NAME/bin/activate" ]; then
+    source "$VENV_NAME/bin/activate"
+else
+    echo "Error: Virtual environment '$VENV_NAME' not found in $PROJECT_DIR"
+    exit 1
+fi
+
+# --------- Run the Python App ---------
+if [ -f "$PYTHON_FILE" ]; then
+    echo "Running $PYTHON_FILE in virtual environment '$VENV_NAME'..."
+    python3 "$PYTHON_FILE"
+else
+    echo "Error: Python file '$PYTHON_FILE' does not exist in $PROJECT_DIR"
+    deactivate  # cleanly exit virtual environment
+    exit 1
+fi
+
+# --------- Cleanup ---------
+# Deactivate the virtual environment after execution
+deactivate
+
+### To make this script executable :
+## chmod +x /home/anup/Portfolio/youtube_downloader/ytube
+
+## Create a symbolic link in /usr/local/bin (or another folder in your $PATH) so you can call it from anywhere:
+## sudo ln -s /home/anup/Portfolio/youtube_downloader/ytube /usr/local/bin/ytube
+
+## Now you can run the script from any directory by simply typing:
+## ytube
