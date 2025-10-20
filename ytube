@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+#This script works only in my laptop because I have hard coded the paths. 
+# Please modify the paths as per your system before using it.
+# Or use ytube_v2 , that is generic version of this script.
 # ========================================================
 # Script Name: ytube
 # Author: Anup Chapain

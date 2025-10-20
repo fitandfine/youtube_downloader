@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# ========================================================
+# Script Name: ytube_v2
+# Author: Anup Chapain
+# Date: 2025-10-21
+# Description:
+#   Runs app.py from the same directory where the script physically resides,
+#   automatically detects the Python virtual environment folder,
+#   and works regardless of symbolic links or execution location.
+# ========================================================
+
+# --------- Resolve the real directory of the script ---------
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do # resolve symlinks
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+# --------- Navigate to Script Directory ---------
+cd "$SCRIPT_DIR" || {
+    echo "Error: Failed to navigate to $SCRIPT_DIR"
+    exit 1
+}
+
+# --------- Detect Virtual Environment Folder ---------
+VENV_NAME=""
+for dir in */ ; do
+    if [ -f "$dir/bin/activate" ]; then
+        VENV_NAME="${dir%/}"  # Remove trailing slash
+        break
+    fi
+done
+
+if [ -z "$VENV_NAME" ]; then
+    echo "Error: No virtual environment folder found in $SCRIPT_DIR"
+    exit 1
+fi
+
+# --------- Activate Virtual Environment ---------
+source "$VENV_NAME/bin/activate" || {
+    echo "Error: Failed to activate virtual environment '$VENV_NAME'"
+    exit 1
+}
+
+# --------- Run the Python App ---------
+PYTHON_FILE="app.py"
+if [ -f "$PYTHON_FILE" ]; then
+    echo "Running $PYTHON_FILE in virtual environment '$VENV_NAME'..."
+    python3 "$PYTHON_FILE"
+else
+    echo "Error: Python file '$PYTHON_FILE' does not exist in $SCRIPT_DIR"
+    deactivate
+    exit 1
+fi
+
+# --------- Cleanup ---------
+deactivate
+# ========================================================
+
+### To make this script executable :
+## chmod +x /home/anup/Portfolio/youtube_downloader/ytube_v2
+
+## Create a symbolic link in /usr/local/bin (or another folder in your $PATH) so you can call it from anywhere:
+## sudo ln -s /home/anup/Portfolio/youtube_downloader/ytube_v2 /usr/local/bin/ytube
+
+## Now you can run the script from any directory by simply typing:
+## ytube
